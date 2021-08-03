@@ -21,9 +21,11 @@ from einops import rearrange
 
 from nle import nethack
 #from custom_actions import CUSTOM_ACTION_SET
+from transformer import Encoder
 
 from .util import id_pairs_table
 import numpy as np
+from torch.autograd import Variable
 
 NUM_GLYPHS = nethack.MAX_GLYPH
 NUM_FEATURES = nethack.BLSTATS_SHAPE[0]
@@ -92,7 +94,7 @@ class NetHackNet(nn.Module):
         return torch.sqrt(self.reward_m2 / self.reward_count)
 
 
-class BaselineNet(NetHackNet):
+class TransformerNet(NetHackNet):
     """This model combines the encodings of the glyphs, top line message and
     blstats into a single fixed-size representation, which is then passed to
     an LSTM core before generating a policy and value head for use in an IMPALA
@@ -105,7 +107,9 @@ class BaselineNet(NetHackNet):
     """
 
     def __init__(self, observation_shape, action_space, flags, device):
-        super(BaselineNet, self).__init__()
+        super(TransformerNet, self).__init__()
+
+        self.opt_step = 0
 
         self.flags = flags
 
@@ -118,8 +122,13 @@ class BaselineNet(NetHackNet):
         self.use_lstm = flags.use_lstm
         self.h_dim = flags.hidden_dim
 
+        self.action_model = ActionEncoder()#nn.Embedding(115,6)
+
         # GLYPH + CROP MODEL
         self.glyph_model = GlyphEncoder(flags, self.H, self.W, flags.crop_dim, device)
+
+        self.inventory_model = InventoryEncoder()
+        self.terminal_model = TerminalEncoder(flags, self.H, self.W, device)
 
         # MESSAGING MODEL
         self.msg_model = MessageEncoder(
@@ -133,6 +142,9 @@ class BaselineNet(NetHackNet):
             self.blstats_model.hidden_dim
             + self.glyph_model.hidden_dim
             + self.msg_model.hidden_dim
+            + self.inventory_model.hidden_dim
+            + self.terminal_model.hidden_dim
+            + self.action_model.hidden_dim
         )
 
         self.fc = nn.Sequential(
@@ -141,6 +153,10 @@ class BaselineNet(NetHackNet):
             nn.Linear(self.h_dim, self.h_dim),
             nn.ReLU(),
         )
+
+        #if self.use_lstm:
+        #    self.core = nn.LSTM(self.h_dim, self.h_dim, num_layers=2)
+        self.encoder = Encoder(self.h_dim, 4, 4)
 
         if self.use_lstm:
             self.core = nn.LSTM(self.h_dim, self.h_dim, num_layers=2)
@@ -161,18 +177,38 @@ class BaselineNet(NetHackNet):
 
     def initial_state(self, batch_size=1):
         return tuple(
-            torch.zeros(self.core.num_layers, batch_size, self.core.hidden_size)
+            torch.zeros(2, batch_size, self.h_dim)
             for _ in range(2)
         )
 
-    def forward(self, inputs, core_state, learning=False):
+    def forward(self, inputs, core_state, optimizer_step=False, learning=False):
         T, B, H, W = inputs["glyphs"].shape
+
+        #print(inputs["inv_oclasses"].shape)
+        action_inputs = inputs["inv_oclasses"][:,:,0]
+        #print(action_inputs.shape, action_inputs)
 
         reps = []
 
         # -- [B' x K] ; B' == (T x B)
         glyphs_rep = self.glyph_model(inputs)
         reps.append(glyphs_rep)
+        #print("glyphs rep", glyphs_rep.shape)
+
+        action_rep = self.action_model(action_inputs)
+        #print("action_rep", action_rep.shape)
+        reps.append(action_rep)
+
+
+
+        #print('pg tty', list(inputs.keys()))
+        #print('pg tty', inputs['tty_chars'].shape)
+
+        inv_rep = self.inventory_model(inputs)
+        reps.append(inv_rep)
+
+        term_rep = self.terminal_model(inputs)
+        reps.append(term_rep)
 
         # -- [B' x K]
         char_rep = self.msg_model(inputs)
@@ -188,8 +224,30 @@ class BaselineNet(NetHackNet):
         # -- [B' x K]
         st = self.fc(st)
 
+        #if learning:
+        #    print("pg st shape", st.shape)
+
+
+        encoder_input = st.view(T, B, -1)
+        #if learning:
+        #    print("pg core_input shape", core_input.shape)
+        encoder_input = torch.swapaxes(encoder_input,0,1)
+        #core_input = st.view(B, T, -1)
+        #if learning:
+        #    print("learning core_input shape", core_input.shape)
+
+        size = encoder_input.shape[1]
+        np_mask = np.triu(np.ones((1, size, size)),k=1).astype('uint8')
+        np_mask =  Variable(torch.from_numpy(np_mask) == 0)
+
+        encoder_output = self.encoder(encoder_input, np_mask)
+
+        #print("pg core_output shape", core_output.shape)
+        encoder_output = torch.flatten(encoder_output, 0, 1)
+        #print("pg core_output shape", core_output.shape)
+
         if self.use_lstm:
-            core_input = st.view(T, B, -1)
+            core_input = encoder_output.view(T, B, -1)
             core_output_list = []
             notdone = (~inputs["done"]).float()
             for input, nd in zip(core_input.unbind(), notdone.unbind()):
@@ -201,11 +259,13 @@ class BaselineNet(NetHackNet):
                 output, core_state = self.core(input.unsqueeze(0), core_state)
                 core_output_list.append(output)
             core_output = torch.flatten(torch.cat(core_output_list), 0, 1)
-        else:
-            core_output = st
+
+
+
 
         # -- [B' x A]
         policy_logits = self.policy(core_output)
+        #print("pg policy logits", policy_logits.shape)
 
         # -- [B' x 1]
         baseline = self.baseline(core_output)
@@ -216,7 +276,13 @@ class BaselineNet(NetHackNet):
             )
 
         if self.training:
-            action = torch.multinomial(F.softmax(policy_logits, dim=1), num_samples=1)
+            # implement oscillating step-temperature here
+            #if optimizer_step:
+            #    self.opt_step = optimizer_step
+            #temp = 6.0 + 5.*np.sin([6.28 * optimizer_step / 1000000])
+            #temperature =  Variable(torch.from_numpy(temp))
+            #print('pg temp', temp)
+            action = torch.multinomial(F.softmax(policy_logits, dim=1), num_samples=1) #/ temperature
         else:
             # Don't sample when testing.
             action = torch.argmax(policy_logits, dim=1)
@@ -226,7 +292,129 @@ class BaselineNet(NetHackNet):
         action = action.view(T, B)
 
         output = dict(policy_logits=policy_logits, baseline=baseline, action=action)
-        return (output, core_state)
+        return output, core_state
+
+class ActionEncoder(nn.Module):
+    def __init__(self):
+        super(ActionEncoder, self).__init__()
+
+        self.action_embedding = nn.Embedding(115, 6)
+        self.hidden_dim = 6
+        self.select = lambda emb, x: select(emb, x, True)
+
+    def forward(self, inputs):
+
+        action_tensors = [
+            self.select(self.action_embedding, inputs.long()),
+        ]
+
+        action_emb = torch.cat(action_tensors, dim=-1)
+        action_emb = rearrange(action_emb, "T B H  -> (T B) H")
+
+        #crop_rep = self.extract_crop_representation(crop_emb)
+        #crop_rep = rearrange(crop_rep, "B C H W -> B (C H W)")
+        #assert crop_rep.shape[0] == T * B
+
+        st = torch.cat([action_emb], dim=1)
+        return st
+
+class TerminalEncoder(nn.Module):
+
+
+    def __init__(self, flags, rows, cols, device=None):
+        super(TerminalEncoder, self).__init__()
+
+        #self.crop = Crop(rows, cols, crop_dim, crop_dim, device)
+        K = flags.embedding_dim  # number of input filters
+        L = flags.layers  # number of convnet layers
+
+        assert (
+            K % 8 == 0
+        ), "This glyph embedding format needs embedding dim to be multiple of 8"
+        unit = K // 8
+        self.chars_embedding = nn.Embedding(6000, K)
+        #self.colors_embedding = nn.Embedding(16, unit)
+        #self.specials_embedding = nn.Embedding(256, unit)
+
+        #self.id_pairs_table = nn.parameter.Parameter(
+        #    torch.from_numpy(id_pairs_table()), requires_grad=False
+        #)
+        #num_groups = self.id_pairs_table.select(1, 1).max().item() + 1
+        #num_ids = self.id_pairs_table.select(1, 0).max().item() + 1
+
+        #self.groups_embedding = nn.Embedding(num_groups, unit)
+        #self.ids_embedding = nn.Embedding(num_ids, 3 * unit)
+
+        F = 3  # filter dimensions
+        S = 1  # stride
+        P = 1  # padding
+        M = 16  # number of intermediate filters
+        self.output_filters = 8
+
+        in_channels = [K] + [M] * (L - 1)
+        out_channels = [M] * (L - 1) + [self.output_filters]
+
+        h, w = rows, cols
+        conv_extract, conv_extract_crop = [], []
+        for i in range(L):
+            conv_extract.append(
+                nn.Conv2d(
+                    in_channels=in_channels[i],
+                    out_channels=out_channels[i],
+                    kernel_size=(F, F),
+                    stride=S,
+                    padding=P,
+                )
+            )
+            conv_extract.append(nn.ELU())
+            '''
+            conv_extract_crop.append(
+                nn.Conv2d(
+                    in_channels=in_channels[i],
+                    out_channels=out_channels[i],
+                    kernel_size=(F, F),
+                    stride=S,
+                    padding=P,
+                )
+            )
+            conv_extract_crop.append(nn.ELU())
+            '''
+
+            # Keep track of output shapes
+            h = conv_outdim(h, F, P, S)
+            w = conv_outdim(w, F, P, S)
+            #c = conv_outdim(c, F, P, S)
+
+        self.hidden_dim = (h * w) * self.output_filters
+        self.extract_representation = nn.Sequential(*conv_extract)
+        #self.extract_crop_representation = nn.Sequential(*conv_extract_crop)
+        self.select = lambda emb, x: select(emb, x, flags.use_index_select)
+
+    def forward(self, inputs):
+        T, B, H, W = inputs["glyphs"].shape
+        #ids, groups = self.glyphs_to_ids_groups(inputs["glyphs"])
+
+        glyph_tensors = [
+            self.select(self.chars_embedding, inputs["chars"].long()),
+        ]
+
+        glyphs_emb = torch.cat(glyph_tensors, dim=-1)
+        glyphs_emb = rearrange(glyphs_emb, "T B H W K -> (T B) K H W")
+
+        #coordinates = inputs["blstats"].view(T * B, -1).float()[:, :2]
+        #crop_emb = self.crop(glyphs_emb, coordinates)
+
+        glyphs_rep = self.extract_representation(glyphs_emb)
+        glyphs_rep = rearrange(glyphs_rep, "B C H W -> B (C H W)")
+        assert glyphs_rep.shape[0] == T * B
+
+        #crop_rep = self.extract_crop_representation(crop_emb)
+        #crop_rep = rearrange(crop_rep, "B C H W -> B (C H W)")
+        #assert crop_rep.shape[0] == T * B
+
+        st = torch.cat([glyphs_rep], dim=1)
+        return st
+
 
 
 class GlyphEncoder(nn.Module):
@@ -403,6 +591,37 @@ class MessageEncoder(nn.Module):
         char_emb = self.char_lt(messages).transpose(1, 2)
         char_rep = self.conv2_6_fc(self.conv1(char_emb))
         return char_rep
+
+
+class InventoryEncoder(nn.Module):
+    """This model encodes the bottom line stats into a fixed size representation.
+
+    It works by simply using two fully-connected layers with ReLU activations.
+    """
+
+    def __init__(self):
+        super(InventoryEncoder, self).__init__()
+        self.num_features = 55
+        self.hidden_dim = 128
+        self.embed_features = nn.Sequential(
+            nn.Linear(self.num_features, self.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+        )
+
+    def forward(self, inputs):
+        T, B, *_ = inputs["inv_glyphs"].shape
+
+        features = inputs["inv_glyphs"]
+        # -- [B' x F]
+        features = features.view(T * B, -1).float()
+        # -- [B x K]
+        features_emb = self.embed_features(features)
+
+        assert features_emb.shape[0] == T * B
+        return features_emb
+
 
 
 class BLStatsEncoder(nn.Module):

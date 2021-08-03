@@ -10,6 +10,8 @@ class CustomNLEWrapper(gym.Wrapper):
         self.env = env
         self.env_id = env_id
 
+        #self.env.observation_space
+
         self.episode_record = []
         self.episode_count = 0
 
@@ -28,8 +30,8 @@ class CustomNLEWrapper(gym.Wrapper):
         #self.episode_record.append([int(x) for x in next_state['blstats']])
 
         self.fog = np.where(next_state['glyphs'] == 2359, np.ones(next_state['glyphs'].shape), np.zeros(next_state['glyphs'].shape))
-        dungeon_level = int(next_state['blstats'][-1])
-        exp_level = int(next_state['blstats'][-7])
+        #dungeon_level = int(next_state['blstats'][-1])
+        #exp_level = int(next_state['blstats'][-7])
         #exp_points = int(next_state['blstats'][-6])
 
         if self.prev_fog.any():
@@ -37,17 +39,17 @@ class CustomNLEWrapper(gym.Wrapper):
             # just max against zero and skip the level checking stuff
             # only rewarded for decreasing fog, never punished for new fog
             z = max(0, z)
-            reward += z/30.
+            reward += z/50.
 
             #print("PG explore reward: ", z)
 
             #if self.prev_level == self.level:
             #    reward += z/20.
 
-        if exp_level < 3 and dungeon_level > 1:
-            print("delved too quickly and too deep!")
-            reward = -100
-            done = True
+        #if exp_level < 3 and dungeon_level > 1:
+        #    print("delved too quickly and too deep!")
+        #    reward = -100
+        #    done = True
 
         self.prev_fog = self.fog
         #self.prev_level = self.level
@@ -63,4 +65,11 @@ class CustomNLEWrapper(gym.Wrapper):
             self.episode_record = []
             self.episode_count += 1
         '''
+        next_state['inv_oclasses'][0] = action
+        #print(self.env_id, next_state['inv_oclasses'][:3])
+        #print(next_state['inv_oclasses'].shape)
+        #print(next_state["message"])
+        #print(next_state['prev_action'])
+        #print('info', info)
+        #info['prev_action'] = action
         return next_state, reward, done, info
